@@ -1,0 +1,106 @@
+from typing import List, Optional
+from sqlmodel import Field, Session, SQLModel, create_engine, select
+from fastapi import FastAPI, HTTPException, Depends
+from datetime import datetime
+
+# === 1. НАСТРОЙКА БАЗЫ ДАННЫХ ===
+sqlite_file_name = "emsana.db"
+sqlite_url = f"sqlite:///{sqlite_file_name}"
+
+engine = create_engine(sqlite_url)
+
+def create_db_and_tables():
+    SQLModel.metadata.create_all(engine)
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+app = FastAPI()
+
+@app.on_event("startup")
+def on_startup():
+    create_db_and_tables()
+
+# === 2. ТАБЛИЦЫ (МОДЕЛИ) ===
+
+class User(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    first_name: str
+    last_name: str
+    role: str  # "doctor" или "patient"
+    doctor_id: Optional[int] = Field(default=None)
+
+class DailyLog(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    patient_id: int
+    temperature: float
+    symptoms: str
+    photo_base64: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+
+class Medication(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    patient_id: int
+    name: str
+    time: str
+    is_taken: bool = False
+
+# === 3. ЭНДПОИНТЫ (API) ===
+
+@app.get("/")
+def read_root():
+    return {"message": "Сервер EmSana работает!"}
+
+# --- Регистрация / Создание юзера ---
+@app.post("/users/", response_model=User)
+def create_user(user: User, session: Session = Depends(get_session)):
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user
+
+# --- Получение юзера ---
+@app.get("/users/{user_id}", response_model=User)
+def get_user(user_id: int, session: Session = Depends(get_session)):
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+# --- Добавить запись в дневник ---
+@app.post("/logs/add", response_model=DailyLog)
+def add_daily_log(log: DailyLog, session: Session = Depends(get_session)):
+    session.add(log)
+    session.commit()
+    session.refresh(log)
+    return log
+
+# --- Врач: Список своих пациентов ---
+@app.get("/doctor/{doctor_id}/patients", response_model=List[User])
+def get_my_patients(doctor_id: int, session: Session = Depends(get_session)):
+    statement = select(User).where(User.doctor_id == doctor_id)
+    results = session.exec(statement)
+    return results.all()
+
+# --- Врач: История болезни пациента ---
+@app.get("/doctor/patient-history/{patient_id}", response_model=List[DailyLog])
+def get_patient_history(patient_id: int, session: Session = Depends(get_session)):
+    statement = select(DailyLog).where(DailyLog.patient_id == patient_id)
+    results = session.exec(statement)
+    return results.all()
+
+# --- Назначить лекарство ---
+@app.post("/medications/add", response_model=Medication)
+def add_medication(med: Medication, session: Session = Depends(get_session)):
+    session.add(med)
+    session.commit()
+    session.refresh(med)
+    return med
+
+# --- Пациент: Мои лекарства ---
+@app.get("/medications/{patient_id}", response_model=List[Medication])
+def get_patient_meds(patient_id: int, session: Session = Depends(get_session)):
+    statement = select(Medication).where(Medication.patient_id == patient_id)
+    results = session.exec(statement)
+    return results.all()
