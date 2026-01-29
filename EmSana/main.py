@@ -3,6 +3,8 @@ from sqlmodel import Field, Session, SQLModel, create_engine, select
 from fastapi import FastAPI, HTTPException, Depends
 from datetime import datetime
 from passlib.context import CryptContext
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn # Импорт нужен для запуска внутри скрипта
 
 # Шифрование паролей
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -29,19 +31,28 @@ def get_session():
 
 app = FastAPI()
 
+# НАСТРОЙКА CORS (ЧТОБЫ ДРУГ МОГ ПОДКЛЮЧИТЬСЯ)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
 
-# ТАБЛИЦЫ (МОДЕЛИ)
+# --- ТАБЛИЦЫ (МОДЕЛИ) ---
 
 class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    # unique=True означает: "В базе не может быть двух одинаковых ИИН"
-    iin: str = Field(unique=True)  # БЫЛО inn, СТАЛО iin
+    email: str = Field(unique=True, index=True) # ДОБАВИЛИ EMAIL
+    iin: str = Field(unique=True)
     first_name: str
     last_name: str
-    role: str
+    role: str # "doctor" или "patient"
     doctor_id: Optional[int] = Field(default=None)
     password: str
 
@@ -60,22 +71,50 @@ class Medication(SQLModel, table=True):
     time: str
     is_taken: bool = False
 
-# ЭНДПОИНТЫ (API) 
+# --- МОДЕЛЬ ДЛЯ ВХОДА (LOGIN) ---
+class LoginRequest(SQLModel):
+    email: str     # ТЕПЕРЬ ВХОД ПО EMAIL
+    password: str
+
+# --- ЭНДПОИНТЫ API --- 
 
 @app.get("/")
 def read_root():
     return {"message": "Сервер EmSana работает!"}
 
-# --- Регистрация / Создание юзера ---
+# 1. Регистрация
 @app.post("/users/", response_model=User)
 def create_user(user: User, session: Session = Depends(get_session)):
+    # Проверяем, нет ли уже такого email или ИИН
+    existing_user = session.exec(select(User).where((User.email == user.email) | (User.iin == user.iin))).first()
+    if existing_user:
+         raise HTTPException(status_code=400, detail="Пользователь с таким Email или ИИН уже существует")
+    
     user.password = get_password_hash(user.password)
     session.add(user)
     session.commit()
     session.refresh(user)
     return user
 
-# --- Получение юзера ---
+# 2. Логин (Вход)
+@app.post("/login")
+def login(request: LoginRequest, session: Session = Depends(get_session)):
+    # Ищем по EMAIL
+    statement = select(User).where(User.email == request.email)
+    user = session.exec(statement).first()
+    
+    if not user or not verify_password(request.password, user.password):
+        return {"status": "error", "message": "Неверный email или пароль"}
+    
+    return {
+        "status": "success", 
+        "user_id": user.id, 
+        "role": user.role,
+        "first_name": user.first_name,
+        "email": user.email
+    }
+
+# Остальные эндпоинты без изменений...
 @app.get("/users/{user_id}", response_model=User)
 def get_user(user_id: int, session: Session = Depends(get_session)):
     user = session.get(User, user_id)
@@ -83,7 +122,6 @@ def get_user(user_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="User not found")
     return user
 
-# --- Добавить запись в дневник ---
 @app.post("/logs/add", response_model=DailyLog)
 def add_daily_log(log: DailyLog, session: Session = Depends(get_session)):
     session.add(log)
@@ -91,21 +129,18 @@ def add_daily_log(log: DailyLog, session: Session = Depends(get_session)):
     session.refresh(log)
     return log
 
-# --- Врач: Список своих пациентов ---
 @app.get("/doctor/{doctor_id}/patients", response_model=List[User])
 def get_my_patients(doctor_id: int, session: Session = Depends(get_session)):
     statement = select(User).where(User.doctor_id == doctor_id)
     results = session.exec(statement)
     return results.all()
 
-# --- Врач: История болезни пациента ---
 @app.get("/doctor/patient-history/{patient_id}", response_model=List[DailyLog])
 def get_patient_history(patient_id: int, session: Session = Depends(get_session)):
     statement = select(DailyLog).where(DailyLog.patient_id == patient_id)
     results = session.exec(statement)
     return results.all()
 
-# --- Назначить лекарство ---
 @app.post("/medications/add", response_model=Medication)
 def add_medication(med: Medication, session: Session = Depends(get_session)):
     session.add(med)
@@ -113,38 +148,12 @@ def add_medication(med: Medication, session: Session = Depends(get_session)):
     session.refresh(med)
     return med
 
-# Создаем модель данных специально для входа (Login)
-class LoginRequest(SQLModel):
-    iin: str   # БЫЛО inn, СТАЛО iin
-    password: str
-
-@app.post("/login")
-def login(request: LoginRequest, session: Session = Depends(get_session)):
-    # 1. Ищем человека по ИИН
-    statement = select(User).where(User.iin == request.iin) # БЫЛО inn, СТАЛО iin
-    user = session.exec(statement).first()
-    
-    # 2. Если такого нет ИЛИ пароль не подходит
-    if not user or not verify_password(request.password, user.password):
-        return {"status": "error", "message": "Неверный логин или пароль"}
-    
-    # 3. Если всё ок
-    return {
-        "status": "success", 
-        "user_id": user.id, 
-        "role": user.role,
-        "first_name": user.first_name
-    }
-
-# --- Пациент: Мои лекарства ---
 @app.get("/medications/{patient_id}", response_model=List[Medication])
 def get_patient_meds(patient_id: int, session: Session = Depends(get_session)):
     statement = select(Medication).where(Medication.patient_id == patient_id)
     results = session.exec(statement)
     return results.all()
 
-
-#запуск
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # ВАЖНО: host="0.0.0.0" открывает доступ по сети
+    uvicorn.run(app, host="0.0.0.0", port=8000)
